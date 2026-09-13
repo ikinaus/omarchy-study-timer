@@ -1,0 +1,25 @@
+-- ---------- Attention test ----------
+-- Two windows, two app ids: the offer (a small dialog) and the test surface.
+-- Both must float. The test window is sized by the client to the exact width of
+-- its 40-column grid, and tiling it would either squeeze that into a horizontal
+-- scroll -- fatal, because the stop click has to land on a cell that was on
+-- screen -- or shove the rest of the workspace aside for four minutes.
+--
+-- No `size` here on purpose: the width follows the cell size, which lives in
+-- the test's own settings. One source of truth for how wide the grid is.
+o.window("^dev\\.mordrud\\.attention$", { float = true, center = true })
+o.window("^dev\\.mordrud\\.attention\\.prompt$", { float = true, center = true })
+
+-- ---------- Vigilance test (PVT) ----------
+-- Fixed-size and centred. The stimulus is a counter inside a box that sits in
+-- one place for the whole run: a tiled window would put that box wherever the
+-- layout happened to leave room, and the eye's starting position is part of the
+-- reaction time being measured.
+o.window("^dev\\.mordrud\\.pvt$", { float = true, center = true })
+o.window("^dev\\.mordrud\\.pvt\\.prompt$", { float = true, center = true })
+
+-- ---------- End of the working day ----------
+-- A two-button question, put past half the norm when the clock has been stopped
+-- for a while. Floating for the same reason as the other prompts: it is a
+-- question, not a workspace, and it disappears the moment it is answered.
+o.window("^dev\\.mordrud\\.study\\.sessionend$", { float = true, center = true })

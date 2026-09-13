@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "mordrud.timer",
+  "name": "Study timer",
+  "version": "4.0.0",
+  "author": "mordrud",
+  "description": "Study timer with reminders, backed by timer.sh",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "Timer.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Study timer",
+    "description": "Study timer with reminders, backed by timer.sh",
+    "category": "Time",
+    "allowMultiple": false
+  }
+}
