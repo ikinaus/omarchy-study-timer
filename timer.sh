@@ -15,6 +15,7 @@
 #   pvt           the vigilance test: run it, or pass a subcommand through
 #   pvt-result    internal; how a prompted offer was answered
 #   end-result    internal; how the end-of-day question was answered
+#   probe         fire a notification on demand, on a throwaway copy
 #   attention     the cancellation test, by hand only -- no longer on the timer
 #
 # Paths derive from this script's own directory, so the tree moves without edits.
@@ -122,6 +123,7 @@ PVT_PY="$PVT_DIR/pvt.py"
 PVT_ANALYZE="$PVT_DIR/analyze.py"
 PVT_PROMPT="$PVT_DIR/prompt.sh"
 END_PROMPT="$ROOT_DIR/bin/session-end.sh"
+PROBE_SH="$ROOT_DIR/dev/notify-probe.sh"
 
 # The day turns over at this hour, not at midnight. Work regularly runs past
 # midnight here, and a calendar boundary split one work session across two days,
@@ -820,6 +822,8 @@ Study timer — $NORM_HOURS h a day, counted from ${DAY_START_HOUR}:00 to ${DAY_
   study toggle-mode     percentage base: of the target / of the day so far
   study snooze          silence reminders for $SNOOZE_HOURS h, ends with the session
   study unsnooze        cancel a snooze, no token needed
+  study probe [what]    fire a notification now, to look at it:
+                        nag | hour | norm | rollover | question | all
   study pvt             take the vigilance test now
   study pvt report            summary over every recorded run
   study pvt status            mode, protocol, how many runs so far
@@ -1036,6 +1040,26 @@ Reminders are off until morning. The clock still works if you come back."
         ;;
     esac
     save_state
+    ;;
+
+  probe)
+    # Fires one of the timer's notifications now, on a throwaway copy of the
+    # tree, so the wording and the sounds can be checked without waiting for the
+    # conditions that normally produce them. Nothing it does touches this
+    # script's own state file.
+    #
+    # The lock is dropped first, as for the other long-running verbs: `probe
+    # all` takes a couple of minutes, and holding the lock through it would
+    # queue every tick and every click on the bar widget behind it.
+    shift
+    [ -r "$PROBE_SH" ] || {
+      printf 'probe: %s is missing\n' "$PROBE_SH" >&2
+      exit 1
+    }
+    flock -u 9
+    # Passed explicitly rather than left to the probe's own default, so it reads
+    # the tree this script belongs to even if that is not the usual location.
+    STUDY_DIR="$ROOT_DIR" exec bash "$PROBE_SH" "$@"
     ;;
 
   attention)
