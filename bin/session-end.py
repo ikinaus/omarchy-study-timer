@@ -34,12 +34,10 @@ PROMPT_TIMEOUT_SECONDS = 120
 
 
 def hm(minutes: int) -> str:
+    """H:MM. A bare minute count is arithmetic the reader has to do first, and
+    the rest of the timer says durations this way."""
     hours, rest = divmod(max(0, minutes), 60)
-    if hours and rest:
-        return f"{hours} ч {rest} мин"
-    if hours:
-        return f"{hours} ч"
-    return f"{rest} мин"
+    return f"{hours}:{rest:02d}"
 
 
 class EndOfDayApp(Gtk.Application):

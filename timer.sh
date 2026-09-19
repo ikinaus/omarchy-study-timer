@@ -270,6 +270,15 @@ EOF
   mv -f "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
+# Durations are shown as H:MM, never as a bare minute count. "Idle for 1983
+# min" is arithmetic the reader has to do before the number means anything, and
+# at that size it stops meaning anything at all.
+hm() {
+  local seconds=$1
+  [ "$seconds" -lt 0 ] && seconds=0
+  printf '%d:%02d' $((seconds / 3600)) $(((seconds % 3600) / 60))
+}
+
 # Seconds banked today, including the run in progress.
 elapsed() {
   if [ "$running" -eq 1 ]; then
@@ -368,9 +377,8 @@ do_rollover() {
     # The point of asking was to deliver it while he was awake; delivering it
     # again at 08:00 would make the earlier one meaningless.
     if [ "$end_answered" -eq 0 ]; then
-      local h=$((total / 3600)) m=$(((total % 3600) / 60))
       notify-send -u critical "End of day" \
-        "$h h $m min today. The day is closed, but nothing stops you from continuing."
+        "$(hm "$total") today. The day is closed, but nothing stops you from continuing."
       # The notification is left unconditional -- it lands in the history and
       # can be read later. The sound is not: the day now turns at 08:00, an hour
       # he is far more likely to be asleep through than midnight.
@@ -448,6 +456,22 @@ presence_track() {
 
   away_gap=$gap
   back_at=$NOW
+
+  # And the idle count starts over. This is the whole point of "idle" as a
+  # measure: it belongs to the current session at the machine, not to the last
+  # time the clock happened to be touched. Without this line it ran across
+  # nights -- 33 hours of accumulated "idle" over three days in which the timer
+  # was simply never started, a number nobody can act on. Sitting back down is
+  # the start of a new session, so the count starts here.
+  idle_present=0
+  end_next_idle=0
+
+  # And the nag ladder, for the same reason `unsnooze` resets it: nag_at has
+  # been sitting in the past for the whole absence, so without this the first
+  # tick back fires a reminder within the minute -- one that opens with "Idle
+  # 0:00", at whatever rung the ladder had reached before he left.
+  nag_level=0
+  nag_at=0
 }
 
 # ------------------------------------------------------------- auto stop
@@ -703,16 +727,16 @@ reminders() {
 
   [ "$NOW" -lt "$nag_at" ] && return 0
 
-  # Present idle, so a reminder never opens with "idle for 1346 min" after a
-  # night. That used to be patched by resetting `since` at the rollover; the
-  # number is now right by construction instead of by amputation.
-  local idle_min=$((idle_present / 60))
+  # Present idle, and only this session's: after a night away it starts from
+  # zero, because the count is reset when he sits back down. It used to be wall
+  # clock since the last stop, which read a night as 1346 minutes of idleness,
+  # and that was patched by resetting `since` at the rollover -- amputation
+  # rather than a definition.
   local urgency=normal
   [ "$nag_level" -ge "$NAG_CRITICAL_FROM" ] && urgency=critical
 
-  local left=$(((NORM_SECONDS - current) / 60))
   notify-send -u "$urgency" "Study timer" \
-    "Idle for $idle_min min. $((left / 60)) h $((left % 60)) min still to go today."
+    "Idle $(hm "$idle_present"). $(hm $((NORM_SECONDS - current))) still to go today."
   [ -r "$DAILY_SOUND_FILE" ] && paplay "$DAILY_SOUND_FILE" &
 
   nag_level=$((nag_level + 1))
@@ -806,8 +830,8 @@ Study timer — $NORM_HOURS h a day, counted from ${DAY_START_HOUR}:00 to ${DAY_
 
 Reminders arrive while the clock is stopped and you are at the machine, on a
 ladder of ${NAG_LADDER[*]} minutes. Idle time means time at the machine with the
-clock stopped; time away from it is not idle, it is absence, and is counted
-separately. A snooze does not stop the idle count -- you are still sitting
+clock stopped, counted from the moment you sat down for this session; time
+away from it is not idle, it is absence, and is counted separately. A snooze does not stop the idle count -- you are still sitting
 here -- but ending one, by hand or by running out, gives every reminder a full
 interval again. Meeting the target is announced once, and
 silences them for the rest of the day.
@@ -999,9 +1023,8 @@ case "${1:-status}" in
         end_next_idle=0
         nag_level=0
         nag_at=0
-        current=$(elapsed)
         notify-send -u critical "End of day" \
-          "$((current / 3600)) h $(((current % 3600) / 60)) min today. \
+          "$(hm "$(elapsed)") today. \
 Reminders are off until morning. The clock still works if you come back."
         # No is_present gate, unlike the one at 08:00: a button was just pressed.
         [ -r "$GOODBOY_SOUND" ] && paplay "$GOODBOY_SOUND" &
