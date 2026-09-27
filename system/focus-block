@@ -1,0 +1,287 @@
+#!/bin/bash
+# focus-block -- the root half of the YouTube block tied to the study timer.
+#
+#   focus-block lock           put the block into /etc/hosts, cancel any pending
+#                              schedule, cut open HTTPS connections in 150 s
+#   focus-block unlock MINUTES take the block out for MINUTES (3..60); the block
+#                              comes back 150 s before the end, connections are
+#                              cut exactly at the end
+#   focus-block kill           cut every established TCP connection to :443
+#   focus-block status         locked / unlocked and the pending schedule
+#
+# Installed as /usr/local/bin/focus-block, root:root 0755, and run through sudo
+# by the timer. Everything it touches is written down in this file: nothing is
+# read from the caller's environment or home, every program is called by its
+# absolute path, and the only value taken from the command line is an integer
+# checked against a fixed range.
+#
+# Fail-closed: whatever goes wrong while it is changing something, it leaves
+# the block in place or puts it back.
+set -eu
+umask 022
+export PATH=/usr/bin
+export LC_ALL=C
+
+# ------------------------------------------------------------------ fixed
+HOSTS=/etc/hosts
+# The new hosts file is written next to the old one, so that the final rename
+# stays on one filesystem and is atomic.
+TMP_TEMPLATE=/etc/.hosts.focus-block.XXXXXX
+# /run is root-only and is emptied at boot, so a lock left by a killed run can
+# never outlive a reboot.
+LOCK_FILE=/run/focus-block.lock
+LOCK_WAIT=30
+SELF=/usr/local/bin/focus-block
+
+BEGIN_MARK='# BEGIN focus-block'
+END_MARK='# END focus-block'
+DOMAINS=(youtube.com www.youtube.com m.youtube.com youtu.be)
+
+# Fixed unit names: a new schedule replaces the old one instead of adding to it.
+LOCK_UNIT=focus-block-lock
+KILL_UNIT=focus-block-kill
+
+# Browsers keep their own DNS cache (Chromium 60 s, Zen up to 120 s). Cutting
+# connections before it expires only makes them reconnect to the old address.
+KILL_DELAY=150
+UNLOCK_MIN=3
+UNLOCK_MAX=60
+
+AWK=/usr/bin/awk
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+DATE=/usr/bin/date
+FLOCK=/usr/bin/flock
+LOGGER=/usr/bin/logger
+MKTEMP=/usr/bin/mktemp
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+SS=/usr/bin/ss
+SYSTEMCTL=/usr/bin/systemctl
+SYSTEMD_RUN=/usr/bin/systemd-run
+
+# ---------------------------------------------------------------- helpers
+log() {
+  "$LOGGER" -t focus-block -- "$*" || true
+}
+
+die() {
+  log "error: $*"
+  printf 'focus-block: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  printf 'usage: focus-block lock | unlock MINUTES (%d..%d) | kill | status\n' \
+    "$UNLOCK_MIN" "$UNLOCK_MAX" >&2
+  exit 2
+}
+
+# The block exactly as this script writes it.
+render_block() {
+  local d
+  printf '%s\n' "$BEGIN_MARK"
+  for d in "${DOMAINS[@]}"; do
+    printf '0.0.0.0 %s\n' "$d"
+    printf ':: %s\n' "$d"
+  done
+  printf '%s\n' "$END_MARK"
+}
+
+# The block currently in the file -- but only if there is exactly one BEGIN
+# and exactly one END, in that order. Anything else prints nothing, which
+# ensure_block reads as "not in the state I want" and rebuilds.
+extract_block() {
+  "$AWK" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+    { line[NR] = $0 }
+    $0 == b { nb++; bi = NR }
+    $0 == e { ne++; ei = NR }
+    END {
+      if (nb == 1 && ne == 1 && bi < ei)
+        for (i = bi; i <= ei; i++) print line[i]
+    }' "$HOSTS"
+}
+
+# The file with every trace of the block taken out:
+#   - everything between a BEGIN and the END that closes it, markers included;
+#   - any marker left without its pair;
+#   - any line identical to one of the block's own entries, wherever it is.
+# An unclosed BEGIN removes only itself. Deleting "from BEGIN to the end of the
+# file" would take the rest of the user's hosts entries with it.
+strip_block() {
+  "$AWK" -v b="$BEGIN_MARK" -v e="$END_MARK" -v entries="$(render_block)" '
+    BEGIN {
+      n = split(entries, a, "\n")
+      for (i = 1; i <= n; i++) ent[a[i]] = 1
+    }
+    { line[NR] = $0 }
+    END {
+      open = 0
+      for (i = 1; i <= NR; i++) {
+        if (line[i] == b) { start = i; open = 1; continue }
+        if (line[i] == e && open) {
+          for (j = start; j <= i; j++) drop[j] = 1
+          open = 0
+        }
+      }
+      for (i = 1; i <= NR; i++) {
+        if (i in drop) continue
+        if (line[i] in ent) continue
+        print line[i]
+      }
+    }' "$HOSTS"
+}
+
+# Replace /etc/hosts with $1, atomically, keeping its mode and owner. A reader
+# sees the old file or the new one, never a half-written one.
+TMP=
+write_hosts() {
+  TMP=$("$MKTEMP" "$TMP_TEMPLATE")
+  printf '%s\n' "$1" > "$TMP"
+  "$CHMOD" --reference="$HOSTS" "$TMP"
+  "$CHOWN" --reference="$HOSTS" "$TMP"
+  "$MV" -f "$TMP" "$HOSTS"
+  TMP=
+}
+
+ensure_block() {
+  local want have stripped
+  want=$(render_block)
+  have=$(extract_block)
+  [ "$have" = "$want" ] && return 0
+  stripped=$(strip_block)
+  write_hosts "$stripped"$'\n'"$want"
+}
+
+remove_block() {
+  local now stripped
+  now=$(< "$HOSTS")
+  stripped=$(strip_block)
+  [ "$now" = "$stripped" ] && return 0
+  write_hosts "$stripped"
+}
+
+# Stops the timers only. The service of the same name may be the very process
+# running this code -- `lock` is started by focus-block-lock.timer -- and
+# stopping it would kill the lock halfway through.
+cancel_timers() {
+  local u
+  for u in "$LOCK_UNIT" "$KILL_UNIT"; do
+    "$SYSTEMCTL" stop "$u.timer" 2> /dev/null || true
+    "$SYSTEMCTL" reset-failed "$u.timer" 2> /dev/null || true
+  done
+}
+
+# A wall-clock time, not "in N seconds": a monotonic timer stops counting
+# while the machine is suspended, so a window would outlive a closed lid by
+# however long it stayed closed. A calendar timer that fell due during sleep
+# fires on resume. AccuracySec: the default lets systemd slip it by a minute.
+schedule() {
+  local unit=$1 at=$2 action=$3 when
+  when=$("$DATE" -u -d "@$at" '+%Y-%m-%d %H:%M:%S UTC')
+  "$SYSTEMD_RUN" --quiet --collect --unit="$unit" \
+    --on-calendar="$when" --timer-property=AccuracySec=1s \
+    "$SELF" "$action"
+}
+
+next_run() {
+  if "$SYSTEMCTL" is-active --quiet "$1.timer" 2> /dev/null; then
+    "$SYSTEMCTL" show -P NextElapseUSecRealtime "$1.timer"
+  else
+    echo '-'
+  fi
+}
+
+# ------------------------------------------------------------- arguments
+# Checked in full before anything is touched: a wrong call changes nothing.
+CMD=${1:-}
+log "cmd=$(printf '%q ' "$@")user=${SUDO_USER:-root}"
+
+case "$CMD" in
+  lock | kill | status)
+    [ "$#" -eq 1 ] || usage
+    ;;
+  unlock)
+    [ "$#" -eq 2 ] || usage
+    # Digits only, no sign, no leading zero, at most two of them -- so the
+    # arithmetic below never sees anything but a small decimal integer.
+    [[ "$2" =~ ^[1-9][0-9]?$ ]] || usage
+    MINUTES=$2
+    [ "$MINUTES" -ge "$UNLOCK_MIN" ] && [ "$MINUTES" -le "$UNLOCK_MAX" ] || usage
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+[ "$EUID" -eq 0 ] || die "must run as root"
+[ -f "$HOSTS" ] && [ ! -L "$HOSTS" ] || die "$HOSTS is not a regular file"
+
+# ------------------------------------------------------------- fail closed
+# From here on any failure of lock, unlock or kill puts the block back.
+CHANGING=0
+on_exit() {
+  local rc=$?
+  [ -n "$TMP" ] && "$RM" -f "$TMP"
+  if [ "$rc" -ne 0 ] && [ "$CHANGING" -eq 1 ]; then
+    CHANGING=0
+    if ensure_block; then
+      log "failed (rc=$rc): block put back"
+    else
+      log "failed (rc=$rc): could NOT put the block back"
+    fi
+    # And the connections: a failed unlock may already have cancelled a
+    # pending cut, and a block without one leaves open tabs working.
+    "$SYSTEMCTL" is-active --quiet "$KILL_UNIT.timer" 2> /dev/null ||
+      schedule "$KILL_UNIT" $(($("$DATE" +%s) + KILL_DELAY)) kill 2> /dev/null ||
+      log "failed (rc=$rc): could not schedule the connection cut"
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+[ "$CMD" = status ] || CHANGING=1
+
+# One run at a time. Two runs reading the file together and writing it one
+# after the other would let the second silently undo the first -- a lock from
+# a timer and an unlock from the study timer in the same second, say.
+exec 9> "$LOCK_FILE"
+"$FLOCK" -w "$LOCK_WAIT" 9 || die "another focus-block run holds $LOCK_FILE"
+
+NOW=$("$DATE" +%s)
+
+# ---------------------------------------------------------------- actions
+case "$CMD" in
+  lock)
+    ensure_block
+    cancel_timers
+    schedule "$KILL_UNIT" $((NOW + KILL_DELAY)) kill
+    log "locked; connections cut at $("$DATE" -d "@$((NOW + KILL_DELAY))" +%T)"
+    ;;
+
+  unlock)
+    # The schedule first, the block second: if the schedule cannot be set,
+    # nothing would ever close the window, so it is never opened.
+    cancel_timers
+    schedule "$LOCK_UNIT" $((NOW + MINUTES * 60 - KILL_DELAY)) lock
+    remove_block
+    log "unlocked for $MINUTES min, until $("$DATE" -d "@$((NOW + MINUTES * 60))" +%T)"
+    ;;
+
+  kill)
+    "$SS" -K -t state established '( dport = :443 )' > /dev/null
+    log "connections to :443 cut"
+    ;;
+
+  status)
+    if [ "$(extract_block)" = "$(render_block)" ]; then
+      state=locked
+    elif [ "$(< "$HOSTS")" = "$(strip_block)" ]; then
+      state=unlocked
+    else
+      state=damaged
+    fi
+    printf 'hosts  %s\n' "$state"
+    printf 'lock   %s\n' "$(next_run "$LOCK_UNIT")"
+    printf 'kill   %s\n' "$(next_run "$KILL_UNIT")"
+    ;;
+esac
