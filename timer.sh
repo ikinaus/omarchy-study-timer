@@ -14,7 +14,6 @@
 #   report        today, weekly average, streak, best day
 #   pvt           the vigilance test: run it, or pass a subcommand through
 #   pvt-result    internal; how a prompted offer was answered
-#   end-result    internal; how the end-of-day question was answered
 #   probe         fire a notification on demand, on a throwaway copy
 #   attention     the cancellation test, by hand only -- no longer on the timer
 #
@@ -50,20 +49,6 @@ NAG_LADDER=(40 30 15 7 5)
 
 # Reminders turn critical from this rung on.
 NAG_CRITICAL_FROM=2
-
-# --------------------------------------------------------- end of day
-# The day turns at 08:00, an hour he is normally asleep through, so the
-# closing sound and notification -- the only ceremony this thing has -- were
-# being delivered to an empty room. Past half the norm a long idle stretch is
-# a plausible end of the working day, so the question is put out loud and
-# "yes" fires the ceremony there and then.
-#
-# It closes nothing. The clock keeps running, work after the answer still
-# accrues to the same day, and 08:00 still does the bookkeeping.
-END_IDLE_MIN=45
-END_ASK_LIMIT=3
-# Below this the question would be absurd: an hour's work is not a day.
-END_GATE_SECONDS=$((NORM_SECONDS / 2))
 
 # How long the machine must look unattended before the clock is stopped. Two
 # minutes rides out a DPMS blink and still lands before the 150 s screensaver.
@@ -122,7 +107,6 @@ PVT_DIR="$ROOT_DIR/pvt"
 PVT_PY="$PVT_DIR/pvt.py"
 PVT_ANALYZE="$PVT_DIR/analyze.py"
 PVT_PROMPT="$PVT_DIR/prompt.sh"
-END_PROMPT="$ROOT_DIR/bin/session-end.sh"
 PROBE_SH="$ROOT_DIR/dev/notify-probe.sh"
 
 # The day turns over at this hour, not at midnight. Work regularly runs past
@@ -181,15 +165,6 @@ away_gap=0
 back_at=0
 anchor_used_at=0
 last_tick=0
-# The end-of-day question: how many times it has been put today, whether it
-# was ever answered "yes" (which is what keeps 08:00 from announcing the day
-# a second time), and when the next ask falls due.
-end_asks=0
-end_answered=0
-# Present-idle seconds at which the next question falls due -- NOT an epoch.
-# Wall clock would fire the question the moment he walked back in after two
-# hours away, which is the one moment it is certainly wrong.
-end_next_idle=0
 # Whether a snooze was running at the previous tick. Only an edge detector:
 # the snooze itself lives in a tmpfs file, and what matters is the moment it
 # stops, which nothing else in the script would otherwise notice.
@@ -223,9 +198,6 @@ load_state() {
       pvt_next_min) pvt_next_min=$value ;;
       pvt_postpone_level) pvt_postpone_level=$value ;;
       idle_before_start) idle_before_start=$value ;;
-      end_asks) end_asks=$value ;;
-      end_answered) end_answered=$value ;;
-      end_next_idle) end_next_idle=$value ;;
       snooze_was) snooze_was=$value ;;
       idle_present) idle_present=$value ;;
       away_since) away_since=$value ;;
@@ -258,9 +230,6 @@ idle_since=$idle_since
 pvt_next_min=$pvt_next_min
 pvt_postpone_level=$pvt_postpone_level
 idle_before_start=$idle_before_start
-end_asks=$end_asks
-end_answered=$end_answered
-end_next_idle=$end_next_idle
 snooze_was=$snooze_was
 idle_present=$idle_present
 away_since=$away_since
@@ -375,18 +344,13 @@ do_rollover() {
   fi
 
   if [ "$total" -gt 0 ]; then
-    # Skipped whole when the ceremony was already handed over during the night.
-    # The point of asking was to deliver it while he was awake; delivering it
-    # again at 08:00 would make the earlier one meaningless.
-    if [ "$end_answered" -eq 0 ]; then
-      notify-send -u critical "End of day" \
-        "$(hm "$total") today. The day is closed, but nothing stops you from continuing."
-      # The notification is left unconditional -- it lands in the history and
-      # can be read later. The sound is not: the day now turns at 08:00, an hour
-      # he is far more likely to be asleep through than midnight.
-      if [ -r "$GOODBOY_SOUND" ] && is_present; then
-        paplay "$GOODBOY_SOUND" &
-      fi
+    notify-send -u critical "End of day" \
+      "$(hm "$total") today. The day is closed, but nothing stops you from continuing."
+    # The notification is left unconditional -- it lands in the history and
+    # can be read later. The sound is not: the day turns at 08:00, an hour he
+    # is far more likely to be asleep through than midnight.
+    if [ -r "$GOODBOY_SOUND" ] && is_present; then
+      paplay "$GOODBOY_SOUND" &
     fi
     record_day "$day" "$total"
   fi
@@ -398,9 +362,6 @@ do_rollover() {
   norm_notified=0
   pvt_next_min=0
   pvt_postpone_level=0
-  end_asks=0
-  end_answered=0
-  end_next_idle=0
   # `away_since`, `away_gap`, `back_at`, `anchor_used_at` and `last_tick`
   # are deliberately NOT reset. The night's absence straddles 08:00, and
   # clearing it here would destroy the one measurement the morning anchor
@@ -466,7 +427,6 @@ presence_track() {
   # was simply never started, a number nobody can act on. Sitting back down is
   # the start of a new session, so the count starts here.
   idle_present=0
-  end_next_idle=0
 
   # And the nag ladder, for the same reason `unsnooze` resets it: nag_at has
   # been sitting in the past for the whole absence, so without this the first
@@ -601,59 +561,9 @@ snooze_edge() {
   if [ "$snooze_was" -eq 1 ] && [ "$active" -eq 0 ]; then
     nag_level=0
     nag_at=0
-    end_next_idle=$((idle_present + END_IDLE_MIN * 60))
   fi
 
   snooze_was=$active
-}
-
-# --------------------------------------------------------- end of day
-# Detects that the question is due and hands off, exactly like pvt_check: the
-# window is opened by a detached helper and the answer comes back through
-# `end-result`, so the flock is never held while a dialog waits.
-#
-# Both describe this tick only and are never persisted. `end_armed` says the
-# question is live for this break, which is what silences the ordinary nag;
-# `end_asked_now` says it actually went up, which silences the nag on the tick
-# of the third and last question, after which `end_armed` stops being set.
-end_armed=0
-end_asked_now=0
-
-end_of_day_check() {
-  [ -r "$END_PROMPT" ] || return 0
-
-  # Working is its own answer. The idle clock starts over at the next stop.
-  if [ "$running" -eq 1 ]; then
-    end_next_idle=0
-    return 0
-  fi
-
-  [ "$end_answered" -eq 1 ] && return 0
-  [ "$end_asks" -ge "$END_ASK_LIMIT" ] && return 0
-  [ "$(elapsed)" -ge "$END_GATE_SECONDS" ] || return 0
-  [ "$(snoozed_until)" -gt 0 ] && return 0
-  is_present || return 0
-
-  # Past every gate: from here on the question owns the interruption channel,
-  # whether or not it is due this minute.
-  end_armed=1
-
-  # Measured in present idle, not wall clock. Forty-five minutes of sitting here
-  # not working is a plausible end of the day; forty-five minutes of being out
-  # of the house is not, and on the wall clock the two are the same number.
-  [ "$end_next_idle" -eq 0 ] && end_next_idle=$((END_IDLE_MIN * 60))
-  [ "$idle_present" -lt "$end_next_idle" ] && return 0
-
-  # Counted and rescheduled BEFORE the helper is launched, for the same reason
-  # the PVT threshold is: a helper that never reports back must not put the
-  # question up again on the very next tick.
-  end_asks=$((end_asks + 1))
-  end_next_idle=$((idle_present + END_IDLE_MIN * 60))
-  end_asked_now=1
-
-  setsid bash "$END_PROMPT" "$(($(elapsed) / 60))" "$((NORM_SECONDS / 60))" \
-    "$end_asks" "$END_ASK_LIMIT" > /dev/null 2>&1 < /dev/null &
-  return 0
 }
 
 # ------------------------------------------------------------- reminders
@@ -696,20 +606,6 @@ reminders() {
     # Running counts as compliance: no reminder is due, and the ladder resets so
     # the next idle stretch starts gently again.
     nag_level=0
-    nag_at=0
-    return 0
-  fi
-
-  # Answered "finished for today": nothing more is said until morning.
-  [ "$end_answered" -eq 1 ] && { nag_at=0; return 0; }
-
-  # While the end-of-day question is armed for this stretch it owns the channel.
-  # Past half the norm "finished?" is put INSTEAD of "come back", not on top of
-  # it -- otherwise the 40-minute nag and the 45-minute question would arrive
-  # five minutes apart. Once all $END_ASK_LIMIT have been answered "no", the
-  # ordinary ladder comes back -- but never in the same tick as the third
-  # question, which is what end_asked_now is for.
-  if [ "$end_armed" -eq 1 ] || [ "$end_asked_now" -eq 1 ]; then
     nag_at=0
     return 0
   fi
@@ -823,7 +719,7 @@ Study timer — $NORM_HOURS h a day, counted from ${DAY_START_HOUR}:00 to ${DAY_
   study snooze          silence reminders for $SNOOZE_HOURS h, ends with the session
   study unsnooze        cancel a snooze, no token needed
   study probe [what]    fire a notification now, to look at it:
-                        nag | hour | norm | rollover | question | all
+                        nag | hour | norm | rollover | all
   study pvt             take the vigilance test now
   study pvt report            summary over every recorded run
   study pvt status            mode, protocol, how many runs so far
@@ -841,11 +737,6 @@ interval again. Meeting the target is announced once, and
 silences them for the rest of the day.
 The clock stops itself if the session locks or the screen goes dark, counting
 only up to the moment you left.
-Past half the norm, every $END_IDLE_MIN idle minutes at the machine it asks
-whether the day is over instead of reminding you to come back, at most
-$END_ASK_LIMIT times. Saying
-yes plays the closing sound now and silences the rest of the day; it does not
-close the day, and time worked afterwards still counts towards it.
 Every $PVT_INTERVAL_MIN worked minutes the vigilance test is offered, with a
 postpone ladder of ${PVT_POSTPONE[*]} minutes; skipping waits for the next
 threshold. Starting the clock within $((ANCHOR_FRESH_SECONDS / 60)) min of
@@ -878,8 +769,6 @@ case "${1:-status}" in
     # out moves the thresholds instead of tripping them.
     snooze_edge
     auto_stop
-    # Before reminders, which need to know whether the question is armed.
-    end_of_day_check
     reminders
     pvt_check
     save_state
@@ -963,11 +852,7 @@ case "${1:-status}" in
     left=$(((snooze_end - NOW) / 60))
     nag_level=0
     nag_at=0
-    # Same for the end-of-day question, which counts present idle and has been
-    # counting it right through the snooze. Set here rather than left to
-    # snooze_edge so that cancelling by hand and running out come to the same
-    # thing; `snooze_was` is cleared so the edge does not fire a second time.
-    end_next_idle=$((idle_present + END_IDLE_MIN * 60))
+    # Cleared so snooze_edge does not reset the ladder a second time.
     snooze_was=0
     save_state
     printf 'Reminders back on. %d h %d min of silence cancelled.\n' \
@@ -1012,30 +897,6 @@ case "${1:-status}" in
         ;;
       *)
         printf 'pvt-result: unknown choice: %s\n' "${2:-}" >&2
-        exit 1
-        ;;
-    esac
-    save_state
-    ;;
-
-  end-result)
-    # Called by bin/session-end.sh once the question has been answered. "no"
-    # needs nothing: the next ask was scheduled before the window opened.
-    case "${2:-no}" in
-      yes)
-        end_answered=1
-        end_next_idle=0
-        nag_level=0
-        nag_at=0
-        notify-send -u critical "End of day" \
-          "$(hm "$(elapsed)") today. \
-Reminders are off until morning. The clock still works if you come back."
-        # No is_present gate, unlike the one at 08:00: a button was just pressed.
-        [ -r "$GOODBOY_SOUND" ] && paplay "$GOODBOY_SOUND" &
-        ;;
-      no) ;;
-      *)
-        printf 'end-result: unknown choice: %s\n' "${2:-}" >&2
         exit 1
         ;;
     esac
