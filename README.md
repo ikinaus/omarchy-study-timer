@@ -16,7 +16,6 @@ rules and the Russian-language test UI are all specific to that setup.
 
 ```
 timer.sh                the timer itself; every verb goes through it
-bin/session-end.{sh,py} the end-of-day question
 pvt/                    the vigilance test (PVT-B): UI, storage, analysis
 attention/              a letter-cancellation test, kept but off the trigger
 assets/                 notification sounds

@@ -2,7 +2,7 @@
 # Fires the timer's notifications on demand, so they can be looked at without
 # waiting for the conditions that normally produce them.
 #
-#   ./notify-probe.sh nag | hour | norm | rollover | question | all
+#   ./notify-probe.sh nag | hour | norm | rollover | all
 #
 # Works on a COPY of the tree in a temp directory, with its own data/. The real
 # state file, history and lock are never touched, so this can run while the
@@ -39,8 +39,7 @@ write_state() {
     echo "absent_since=0";     echo "norm_notified=0"
     echo "idle_since=0";       echo "pvt_next_min=90"
     echo "pvt_postpone_level=0"; echo "idle_before_start=0"
-    echo "end_asks=0";         echo "end_answered=0"
-    echo "end_next_idle=0";    echo "snooze_was=0"
+    echo "snooze_was=0"
     echo "idle_present=0";     echo "away_since=0"
     echo "away_gap=0";         echo "back_at=0"
     echo "anchor_used_at=0";   echo "last_tick=$NOW"
@@ -73,39 +72,10 @@ probe_norm() {
 }
 
 probe_rollover() {
-  say "rollover — 08:00, day closed, ceremony not yet handed over"
+  say "rollover — 08:00, day closed"
   echo "  expected:  End of day  7:05 today. …   + goodboy.mp3"
-  write_state "day=1999-01-01" "total=$((7 * 3600 + 5 * 60))" "end_answered=0"
+  write_state "day=1999-01-01" "total=$((7 * 3600 + 5 * 60))"
   bash "$T/timer.sh" tick
-}
-
-probe_question() {
-  say "question — past half the norm, 45 min of idle at the machine"
-  echo "  expected:  a two-button window. Pressing 'Да' plays the ceremony,"
-  echo "             pressing 'Ещё поработаю' leaves it silent."
-  write_state "total=$((6 * 3600 + 30 * 60))" "idle_present=$((46 * 60))"
-  bash "$T/timer.sh" tick
-  # The helper is detached, so without waiting this script would reach its trap
-  # and delete the directory the helper is still reading from.
-  #
-  # Waiting on the helper's own lock rather than on a process name: `pgrep -f
-  # session-end` also matches any shell whose command line happens to contain
-  # the string, this script's own invocation included, and that turns the wait
-  # into a hang. The lock is held for exactly as long as a window is up.
-  #
-  # It is the same lock the real timer's question uses, so if one of those is
-  # already on screen this scenario produces nothing and returns at once. That
-  # is the correct behaviour: two of these windows must never be open together.
-  echo "  (waiting for the window; it times out on its own after 2 min)"
-  sleep 2
-  local waited=0
-  local lock="${XDG_RUNTIME_DIR:-/tmp}/omarchy-study-end.lock"
-  while [ "$waited" -lt 150 ]; do
-    flock -n "$lock" true 2> /dev/null && break
-    sleep 2
-    waited=$((waited + 2))
-  done
-  grep -E '^(end_asks|end_answered)=' "$T/data/study_timer_state" | sed 's/^/  /'
 }
 
 case "$SCENARIO" in
@@ -113,16 +83,14 @@ case "$SCENARIO" in
   hour)     probe_hour ;;
   norm)     probe_norm ;;
   rollover) probe_rollover ;;
-  question) probe_question ;;
   all)
     for p in nag hour norm rollover; do
       "probe_$p"
       sleep 4
     done
-    probe_question
     ;;
   *)
-    echo "usage: $0 nag | hour | norm | rollover | question | all" >&2
+    echo "usage: $0 nag | hour | norm | rollover | all" >&2
     exit 1
     ;;
 esac
