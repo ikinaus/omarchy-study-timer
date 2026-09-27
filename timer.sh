@@ -45,7 +45,7 @@ NORM_HOURS=10
 NORM_SECONDS=$((NORM_HOURS * 3600))
 
 # Minutes of idle before each successive reminder. The last value repeats.
-NAG_LADDER=(40 30 15 7 5)
+NAG_LADDER=(40 15 5 30 15 7 5)
 
 # Reminders turn critical from this rung on.
 NAG_CRITICAL_FROM=2
