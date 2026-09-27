@@ -50,6 +50,29 @@ NAG_LADDER=(40 15 5 30 15 7 5)
 # Reminders turn critical from this rung on.
 NAG_CRITICAL_FROM=2
 
+# ---------------------------------------------------------------- YouTube
+# YouTube is blocked in /etc/hosts by a root helper (system/focus-block, run
+# through sudo). This script only decides when to open and close it.
+FOCUS_BIN=/usr/local/bin/focus-block
+# Worked minutes that earn a window, counted from the end of the last window
+# and from 08:00. The window opens when the clock is stopped.
+FOCUS_QUOTA_MIN=120
+FOCUS_WINDOW_MIN=60
+# Warning this many minutes before the window closes.
+FOCUS_WARN_MIN=5
+# Worked hours in a day after which YouTube stays open until the day turns.
+FOCUS_FULL_HOURS=10
+# How often that open-until-morning state is renewed. The helper never opens
+# for more than 60 minutes at a time, so if this script dies, YouTube closes
+# by itself within the hour.
+FOCUS_EXTEND_MIN=30
+# After a failed call to the helper, wait this long before trying again, so a
+# broken setup costs one notification every few minutes, not one a minute.
+FOCUS_RETRY_MIN=5
+# A new random id on every boot. A different id than at the last unlock means
+# the machine restarted, and the boot service has closed YouTube.
+BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
+
 # How long the machine must look unattended before the clock is stopped. Two
 # minutes rides out a DPMS blink and still lands before the 150 s screensaver.
 AWAY_GRACE=120
@@ -169,6 +192,19 @@ last_tick=0
 # the snooze itself lives in a tmpfs file, and what matters is the moment it
 # stops, which nothing else in the script would otherwise notice.
 snooze_was=0
+# YouTube. `fb_mode`: 0 closed, 1 a window is open, 2 open until the day
+# turns. `fb_mark`: worked seconds today when the last window ended -- the
+# quota counts from there. `fb_until`: when the open window ends.
+# `fb_warned`: the closing warning has gone out for this window.
+# `fb_extend_at`: when mode 2 is renewed next. `fb_boot`: boot id at the last
+# successful unlock. `fb_retry_at`: no unlock attempt before this moment.
+fb_mode=0
+fb_mark=0
+fb_until=0
+fb_warned=0
+fb_extend_at=0
+fb_boot=
+fb_retry_at=0
 
 load_state() {
   [ -s "$STATE_FILE" ] || return 0
@@ -199,6 +235,13 @@ load_state() {
       pvt_postpone_level) pvt_postpone_level=$value ;;
       idle_before_start) idle_before_start=$value ;;
       snooze_was) snooze_was=$value ;;
+      fb_mode) fb_mode=$value ;;
+      fb_mark) fb_mark=$value ;;
+      fb_until) fb_until=$value ;;
+      fb_warned) fb_warned=$value ;;
+      fb_extend_at) fb_extend_at=$value ;;
+      fb_boot) fb_boot=$value ;;
+      fb_retry_at) fb_retry_at=$value ;;
       idle_present) idle_present=$value ;;
       away_since) away_since=$value ;;
       away_gap) away_gap=$value ;;
@@ -237,6 +280,13 @@ away_gap=$away_gap
 back_at=$back_at
 anchor_used_at=$anchor_used_at
 last_tick=$last_tick
+fb_mode=$fb_mode
+fb_mark=$fb_mark
+fb_until=$fb_until
+fb_warned=$fb_warned
+fb_extend_at=$fb_extend_at
+fb_boot=$fb_boot
+fb_retry_at=$fb_retry_at
 EOF
   mv -f "$STATE_FILE.tmp" "$STATE_FILE"
 }
@@ -362,6 +412,15 @@ do_rollover() {
   norm_notified=0
   pvt_next_min=0
   pvt_postpone_level=0
+  # Open-until-morning ends with the day, and the quota starts from zero. A
+  # window that happens to straddle 08:00 is left to run out on its own.
+  if [ "$fb_mode" -eq 2 ]; then
+    focus_call lock || true
+    fb_mode=0
+    notify-send -u normal "YouTube" \
+      "New day: YouTube is closed. $(hm $((FOCUS_QUOTA_MIN * 60))) of work opens the next window."
+  fi
+  fb_mark=0
   # `away_since`, `away_gap`, `back_at`, `anchor_used_at` and `last_tick`
   # are deliberately NOT reset. The night's absence straddles 08:00, and
   # clearing it here would destroy the one measurement the morning anchor
@@ -566,6 +625,133 @@ snooze_edge() {
   snooze_was=$active
 }
 
+# ---------------------------------------------------------------- YouTube
+# Every call to the helper goes through focus_call, and a failed call never
+# changes the state here: a window the helper did not open is not recorded as
+# open. Closing is different -- the helper closes every window by itself when
+# its time is up, so the state here moves to "closed" even if the call failed.
+
+# A message about YouTube that is due this tick. reminders() attaches it to an
+# idle reminder due at about the same moment; focus_flush sends whatever is
+# left on its own. Runtime only, never saved.
+focus_note=""
+
+current_boot() {
+  cat "$BOOT_ID_FILE" 2> /dev/null || echo unknown
+}
+
+focus_call() {
+  local out
+  if out=$(sudo -n "$FOCUS_BIN" "$@" 2>&1); then
+    return 0
+  fi
+  logger -t study-timer -- "focus-block $* failed: $out" 2> /dev/null || true
+  notify-send -u critical "YouTube" "focus-block $* failed: ${out:-no output}"
+  return 1
+}
+
+focus_unlock() {
+  [ "$NOW" -ge "$fb_retry_at" ] || return 1
+  if focus_call unlock "$1"; then
+    fb_retry_at=0
+    fb_boot=$(current_boot)
+    return 0
+  fi
+  fb_retry_at=$((NOW + FOCUS_RETRY_MIN * 60))
+  return 1
+}
+
+# The window is over: the quota counts again from what is worked now.
+focus_reset() {
+  fb_mode=0
+  fb_until=0
+  fb_warned=0
+  fb_mark=$(elapsed)
+}
+
+focus_check() {
+  local current left
+  current=$(elapsed)
+
+  # Open until the day turns: renew before the helper's 60 minutes run out,
+  # and at once after a restart, which closed it.
+  if [ "$fb_mode" -eq 2 ]; then
+    if [ "$NOW" -ge "$fb_extend_at" ] || [ "$fb_boot" != "$(current_boot)" ]; then
+      focus_unlock 60 && fb_extend_at=$((NOW + FOCUS_EXTEND_MIN * 60))
+    fi
+    return 0
+  fi
+
+  if [ "$current" -ge $((FOCUS_FULL_HOURS * 3600)) ]; then
+    if focus_unlock 60; then
+      fb_mode=2
+      fb_until=0
+      fb_warned=0
+      fb_extend_at=$((NOW + FOCUS_EXTEND_MIN * 60))
+      notify-send -u normal "YouTube" \
+        "$FOCUS_FULL_HOURS h done: YouTube is open until $(printf '%02d:00' "$DAY_START_HOUR")."
+    fi
+    return 0
+  fi
+
+  if [ "$fb_mode" -eq 1 ]; then
+    if [ "$NOW" -ge "$fb_until" ]; then
+      focus_reset
+      focus_note="YouTube is closed."
+      return 0
+    fi
+    # Restarted during the window: the boot service closed YouTube. Reopen
+    # what is left, unless it is below the helper's 3-minute minimum.
+    if [ "$fb_boot" != "$(current_boot)" ]; then
+      left=$(((fb_until - NOW) / 60))
+      if [ "$left" -lt 3 ]; then
+        focus_reset
+        focus_note="YouTube is closed."
+        return 0
+      fi
+      [ "$left" -gt 60 ] && left=60
+      focus_unlock "$left" && notify-send -u normal "YouTube" \
+        "Reopened after the restart, until $(date -d "@$fb_until" +%H:%M)."
+      return 0
+    fi
+    if [ "$fb_warned" -eq 0 ] && [ "$NOW" -ge $((fb_until - FOCUS_WARN_MIN * 60)) ]; then
+      fb_warned=1
+      focus_note="YouTube closes in $FOCUS_WARN_MIN min."
+    fi
+    return 0
+  fi
+
+  # Closed. Opens once the quota is worked, the clock is stopped and he is at
+  # the machine -- the same condition under which idle time is counted. A stop
+  # by locking the screen therefore opens nothing until he is back.
+  [ "$running" -eq 0 ] || return 0
+  [ $((current - fb_mark)) -ge $((FOCUS_QUOTA_MIN * 60)) ] || return 0
+  machine_unattended && return 0
+  if focus_unlock "$FOCUS_WINDOW_MIN"; then
+    fb_mode=1
+    fb_until=$((NOW + FOCUS_WINDOW_MIN * 60))
+    fb_warned=0
+    notify-send -u normal "YouTube" \
+      "Open until $(date -d "@$fb_until" +%H:%M)."
+  fi
+}
+
+# Starting the clock during a window closes it at once; the rest is lost.
+# Open-until-morning is not affected.
+focus_on_start() {
+  [ "$fb_mode" -eq 1 ] || return 0
+  focus_call lock || true
+  focus_reset
+  notify-send -u normal "YouTube" \
+    "Closed: the clock is running. The next window takes another $(hm $((FOCUS_QUOTA_MIN * 60)))."
+}
+
+focus_flush() {
+  [ -n "$focus_note" ] || return 0
+  notify-send -u normal "YouTube" "$focus_note"
+  focus_note=""
+}
+
 # ------------------------------------------------------------- reminders
 nag_interval() {
   local index=$1
@@ -623,6 +809,12 @@ reminders() {
     return 0
   fi
 
+  # A YouTube message due now goes out inside a reminder that is due within
+  # two minutes anyway, instead of as a second notification a tick apart.
+  if [ -n "$focus_note" ] && [ "$nag_at" -le $((NOW + 120)) ]; then
+    nag_at=$NOW
+  fi
+
   [ "$NOW" -lt "$nag_at" ] && return 0
 
   # Present idle, and only this session's: after a night away it starts from
@@ -634,7 +826,8 @@ reminders() {
   [ "$nag_level" -ge "$NAG_CRITICAL_FROM" ] && urgency=critical
 
   notify-send -u "$urgency" "Study timer" \
-    "Idle $(hm "$idle_present"). $(hm $((NORM_SECONDS - current))) still to go today."
+    "Idle $(hm "$idle_present"). $(hm $((NORM_SECONDS - current))) still to go today.${focus_note:+ $focus_note}"
+  focus_note=""
   [ -r "$DAILY_SOUND_FILE" ] && paplay "$DAILY_SOUND_FILE" &
 
   nag_level=$((nag_level + 1))
@@ -743,6 +936,12 @@ threshold. Starting the clock within $((ANCHOR_FRESH_SECONDS / 60)) min of
 returning from $((ANCHOR_IDLE_SECONDS / 3600)) h or more away from the machine
 offers it at once instead, as the day's anchor.
 
+YouTube is blocked by $FOCUS_BIN. Every $(hm $((FOCUS_QUOTA_MIN * 60))) worked opens it for
+$FOCUS_WINDOW_MIN min, starting when you stop the clock; starting the clock again
+closes it early. A warning comes $FOCUS_WARN_MIN min before the end. After $FOCUS_FULL_HOURS h
+in a day it stays open until $(printf '%02d:00' "$DAY_START_HOUR"). The count starts over after every
+window and every morning.
+
 Left-click the bar widget to start or stop, right-click to switch the base.
 Files live in $ROOT_DIR.
 EOF
@@ -769,7 +968,11 @@ case "${1:-status}" in
     # out moves the thresholds instead of tripping them.
     snooze_edge
     auto_stop
+    # After auto_stop, so a stop found this tick is seen; before reminders,
+    # which may carry its message.
+    focus_check
     reminders
+    focus_flush
     pvt_check
     save_state
     ;;
@@ -800,6 +1003,14 @@ case "${1:-status}" in
     nag_level=0
     nag_at=0
     absent_since=0
+    # A click is proof of presence, so a window due on this stop opens now
+    # rather than on the next tick.
+    if [ "$running" -eq 1 ]; then
+      focus_on_start
+    else
+      focus_check
+      focus_flush
+    fi
     save_state
     ;;
 
@@ -997,6 +1208,19 @@ case "${1:-status}" in
       tip="$tip · met"
       class=done
     fi
+
+    case "$fb_mode" in
+      1) tip="$tip · YouTube until $(date -d "@$fb_until" +%H:%M)" ;;
+      2) tip="$tip · YouTube open until $(printf '%02d:00' "$DAY_START_HOUR")" ;;
+      *)
+        yt_left=$((FOCUS_QUOTA_MIN * 60 - (current - fb_mark)))
+        if [ "$yt_left" -gt 0 ]; then
+          tip="$tip · YouTube after $(hm "$yt_left") more"
+        else
+          tip="$tip · YouTube on the next stop"
+        fi
+        ;;
+    esac
 
     # One object per call. The version this replaced printed here and then fell
     # through to a second printf, so two JSON objects went out and the module
