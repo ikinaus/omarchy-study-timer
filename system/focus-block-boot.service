@@ -1,0 +1,16 @@
+# Install as /etc/systemd/system/focus-block-boot.service, then
+# `systemctl enable focus-block-boot.service`.
+#
+# A reboot during a window takes the pending re-lock with it: the timers set by
+# `focus-block unlock` live only until shutdown. This puts the block back on
+# every boot. If the study timer is running afterwards, it reopens whatever is
+# left of the window itself.
+[Unit]
+Description=Put the YouTube block back at boot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/focus-block lock
+
+[Install]
+WantedBy=multi-user.target

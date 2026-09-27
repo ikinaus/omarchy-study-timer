@@ -1,0 +1,8 @@
+# Install as /etc/sudoers.d/focus-block -- WITHOUT the ".sudoers" suffix:
+# sudo silently skips files in sudoers.d whose name contains a dot.
+# Owner root:root, mode 0440. Check with `visudo -cf` before installing.
+#
+# Lets the study timer run the helper without a password. Any arguments are
+# allowed here on purpose: the helper itself refuses everything but
+# lock, unlock 3..60, kill and status.
+mordrud ALL=(root) NOPASSWD: /usr/local/bin/focus-block
